@@ -163,6 +163,107 @@ export class MyMCP extends McpAgent<Props, Env> {
     ];
 
     registerTools(this.server, allTools, context);
+
+    // Generic Drive tools intentionally use the current Feishu user's OAuth token.
+    // They never accept a server-side filesystem path: files are supplied as base64
+    // so an MCP client cannot make the Worker read arbitrary local files.
+    const requestDrive = async (path: string, init: RequestInit = {}) => {
+      const response = await fetch(`https://open.feishu.cn/open-apis${path}`, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${this.props.accessToken}`,
+          ...(init.headers || {}),
+        },
+      });
+      const payload = await response.json() as { code?: number; msg?: string; data?: unknown };
+      if (!response.ok || payload.code !== 0) {
+        throw new Error(`Feishu Drive request failed: ${payload.msg || response.statusText} (code ${payload.code ?? response.status})`);
+      }
+      return payload.data;
+    };
+
+    const asResult = (data: unknown) => ({
+      content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+    });
+
+    this.server.tool(
+      'drive_get_root_folder',
+      '获取当前已授权飞书用户的云空间根目录 token。后续列目录或创建文件夹时使用。',
+      {},
+      async () => asResult(await requestDrive('/drive/explorer/v2/root_folder/meta')),
+    );
+
+    this.server.tool(
+      'drive_list_files',
+      '列出飞书云盘指定文件夹中的文件和子文件夹。folder_token 可传 root；默认返回最多 100 项。',
+      {
+        folder_token: z.string().default('root').describe('要列出的文件夹 token；根目录用 root'),
+        page_size: z.number().int().min(1).max(100).default(100).describe('单页返回数量'),
+        page_token: z.string().optional().describe('上一页结果返回的分页 token'),
+      },
+      async ({ folder_token, page_size, page_token }) => {
+        const query = new URLSearchParams({ folder_token, page_size: String(page_size) });
+        if (page_token) query.set('page_token', page_token);
+        return asResult(await requestDrive(`/drive/v1/files?${query.toString()}`));
+      },
+    );
+
+    this.server.tool(
+      'drive_create_folder',
+      '在飞书云盘指定父文件夹中新建一个文件夹。不会覆盖同名文件夹。',
+      {
+        name: z.string().min(1).max(250).describe('新文件夹名称'),
+        parent_folder_token: z.string().default('root').describe('父文件夹 token；根目录用 root'),
+      },
+      async ({ name, parent_folder_token }) => asResult(await requestDrive('/drive/v1/files/create_folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ name, folder_token: parent_folder_token }),
+      })),
+    );
+
+    this.server.tool(
+      'drive_upload_file',
+      '上传一个不超过 20MB 的普通文件到飞书云盘文件夹。内容必须是 base64 编码；同名文件不会自动覆盖。',
+      {
+        name: z.string().min(1).max(250).describe('包含扩展名的文件名'),
+        folder_token: z.string().describe('目标文件夹 token'),
+        content_base64: z.string().min(1).describe('文件的 Base64 内容；可带 data: 前缀'),
+      },
+      async ({ name, folder_token, content_base64 }) => {
+        const encoded = content_base64.replace(/^data:[^;]+;base64,/, '');
+        const binary = atob(encoded);
+        const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+        if (bytes.byteLength > 20 * 1024 * 1024) {
+          throw new Error('文件超过飞书全量上传 20MB 限制，请改用分片上传。');
+        }
+        const form = new FormData();
+        form.append('file_name', name);
+        form.append('parent_type', 'explorer');
+        form.append('parent_node', folder_token);
+        form.append('size', String(bytes.byteLength));
+        form.append('file', new File([bytes], name));
+        return asResult(await requestDrive('/drive/v1/files/upload_all', {
+          method: 'POST',
+          body: form,
+        }));
+      },
+    );
+
+    this.server.tool(
+      'drive_move_file',
+      '将飞书云盘中的文件或文件夹移动到目标文件夹。该操作会改变云端位置。',
+      {
+        file_token: z.string().describe('要移动的文件或文件夹 token'),
+        type: z.enum(['file', 'folder', 'doc', 'docx', 'sheet', 'bitable', 'mindnote']).describe('资源类型'),
+        destination_folder_token: z.string().describe('目标文件夹 token'),
+      },
+      async ({ file_token, type, destination_folder_token }) => asResult(await requestDrive(`/drive/v1/files/${encodeURIComponent(file_token)}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ type, folder_token: destination_folder_token }),
+      })),
+    );
   }
 }
 
