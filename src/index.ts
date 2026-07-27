@@ -250,6 +250,82 @@ export class MyMCP extends McpAgent<Props, Env> {
       },
     );
 
+    // MCP clients can have a much smaller message limit than Feishu's 20MB
+    // upload limit. These three tools use Durable Object storage as a short-lived
+    // staging area so clients can stream a local file in safe base64 chunks.
+    const uploadPrefix = 'drive-upload:';
+    type PendingUpload = { name: string; folderToken: string };
+
+    this.server.tool(
+      'drive_upload_begin',
+      '开始一次分块上传，适合内容无法一次放入 MCP 消息的大文件。返回 transfer_id，随后按顺序追加分块。',
+      {
+        name: z.string().min(1).max(250).describe('包含扩展名的文件名'),
+        folder_token: z.string().describe('目标文件夹 token'),
+      },
+      async ({ name, folder_token }) => {
+        const transferId = crypto.randomUUID();
+        await this.ctx.storage.put<PendingUpload>(`${uploadPrefix}${transferId}:meta`, {
+          name,
+          folderToken: folder_token,
+        });
+        return asResult({ transfer_id: transferId, max_chunk_bytes: 24576 });
+      },
+    );
+
+    this.server.tool(
+      'drive_upload_append',
+      '向已开始的分块上传追加一个 Base64 分块。每块解码后不得超过 24KB，chunk_index 必须从 0 开始连续递增。',
+      {
+        transfer_id: z.string().uuid().describe('drive_upload_begin 返回的 transfer_id'),
+        chunk_index: z.number().int().min(0).describe('从 0 开始的连续分块序号'),
+        content_base64: z.string().min(1).max(40000).describe('不带 data: 前缀的 Base64 分块内容'),
+      },
+      async ({ transfer_id, chunk_index, content_base64 }) => {
+        const clean = content_base64.replace(/^data:[^;]+;base64,/, '');
+        const decodedSize = atob(clean).length;
+        if (decodedSize > 24576) throw new Error('分块超过 24KB 限制。');
+        const meta = await this.ctx.storage.get<PendingUpload>(`${uploadPrefix}${transfer_id}:meta`);
+        if (!meta) throw new Error('上传会话不存在或已完成，请重新开始上传。');
+        const key = `${uploadPrefix}${transfer_id}:part:${String(chunk_index).padStart(6, '0')}`;
+        await this.ctx.storage.put(key, clean);
+        return asResult({ transfer_id, chunk_index, received_bytes: decodedSize });
+      },
+    );
+
+    this.server.tool(
+      'drive_upload_complete',
+      '完成分块上传：在 Worker 内合并已上传的分块并上传到飞书云盘。成功后会自动清理临时分块。',
+      { transfer_id: z.string().uuid().describe('drive_upload_begin 返回的 transfer_id') },
+      async ({ transfer_id }) => {
+        const metaKey = `${uploadPrefix}${transfer_id}:meta`;
+        const meta = await this.ctx.storage.get<PendingUpload>(metaKey);
+        if (!meta) throw new Error('上传会话不存在或已完成，请重新开始上传。');
+        const chunks = await this.ctx.storage.list<string>({ prefix: `${uploadPrefix}${transfer_id}:part:` });
+        if (chunks.size === 0) throw new Error('未收到任何分块，无法完成上传。');
+        const buffers = [...chunks.entries()]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([, encoded]) => Uint8Array.from(atob(encoded), char => char.charCodeAt(0)));
+        const size = buffers.reduce((total, bytes) => total + bytes.byteLength, 0);
+        if (size > 20 * 1024 * 1024) throw new Error('文件超过飞书全量上传 20MB 限制。');
+        const content = new Uint8Array(size);
+        let offset = 0;
+        for (const buffer of buffers) {
+          content.set(buffer, offset);
+          offset += buffer.byteLength;
+        }
+        const form = new FormData();
+        form.append('file_name', meta.name);
+        form.append('parent_type', 'explorer');
+        form.append('parent_node', meta.folderToken);
+        form.append('size', String(size));
+        form.append('file', new File([content], meta.name));
+        const result = await requestDrive('/drive/v1/files/upload_all', { method: 'POST', body: form });
+        await this.ctx.storage.delete([metaKey, ...chunks.keys()]);
+        return asResult({ ...(result as object), file_name: meta.name, file_size: size });
+      },
+    );
+
     this.server.tool(
       'drive_move_file',
       '将飞书云盘中的文件或文件夹移动到目标文件夹。该操作会改变云端位置。',
